@@ -109,6 +109,22 @@ struct msi_desc {
 			};
 		};
 
+		/* VIS specific data */
+		struct vis {
+			/* 32 vectors mask bits */
+			u32 masked;
+			struct {
+				u16	entry_nr;
+				unsigned default_irq;
+			} vis_attrib;
+			struct {
+				/* VET register base */
+				void __iomem *vet_base;
+				/* MBA register base */
+				void __iomem *mask_base;
+			} base;
+		} vis; 
+
 		/*
 		 * Non PCI variants add their data structure here. New
 		 * entries need to use a named structure. We want
