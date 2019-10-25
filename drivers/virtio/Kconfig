@@ -73,6 +73,15 @@ config VIRTIO_MMIO
 
  	 If unsure, say N.
 
+config VIRTIO_VIS
+	tristate "virtio vis interrupt"
+	depends on VIRTIO_MMIO
+	select GENERIC_MSI_IRQ
+	select GENERIC_MSI_IRQ_DOMAIN
+	---help---
+
+	If unsure, say N.
+
 config VIRTIO_MMIO_CMDLINE_DEVICES
 	bool "Memory mapped virtio devices parameter parsing"
 	depends on VIRTIO_MMIO
