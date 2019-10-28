@@ -5,5 +5,5 @@
 #include <linux/device.h>
 
 int vis_irq_vector(struct device *dev, unsigned int nr);
-
+int vis_setup_irqs(struct device *dev, int nvec);
 #endif

@@ -11,4 +11,5 @@ int pci_msi_prepare(struct irq_domain *domain, struct device *dev, int nvec,
 
 void pci_msi_set_desc(msi_alloc_info_t *arg, struct msi_desc *desc);
 
+struct irq_domain *vis_get_irq_domain(void);
 #endif /* _ASM_X86_MSI_H */

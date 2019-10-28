@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Support of MSI, HPET and DMAR interrupts.
+ * Support of MSI, VIS, HPET and DMAR interrupts.
  *
  * Copyright (C) 1997, 1998, 1999, 2000, 2009 Ingo Molnar, Hajnalka Szabo
  *	Moved from arch/x86/kernel/apic/io_apic.c.
@@ -46,6 +46,76 @@ static void irq_msi_compose_msg(struct irq_data *data, struct msi_msg *msg)
 		MSI_DATA_DELIVERY_FIXED |
 		MSI_DATA_VECTOR(cfg->vector);
 }
+
+
+/*
+ * IRQ Chip for VIS Virtio Devices which implement VIS Structure.
+ */
+static struct irq_chip vis_controller = {
+	.name                   = "VIS",
+	.irq_unmask             = vis_unmask_irq,
+	.irq_mask               = vis_mask_irq,
+	.irq_ack                = irq_chip_ack_parent,
+	.irq_retrigger          = irq_chip_retrigger_hierarchy,
+	.irq_compose_msi_msg    = irq_msi_compose_msg,
+	.irq_write_msi_msg      = vis_domain_write_msg,
+	.flags                  = IRQCHIP_SKIP_SET_WAKE,
+};
+
+static irq_hw_number_t vis_get_hwirq(struct msi_domain_info *info,
+				     msi_alloc_info_t *arg)
+{
+	return arg->vis_hwirq;
+}
+
+static int vis_prepare(struct irq_domain *domain, struct device *dev,
+		       int nvec, msi_alloc_info_t *arg)
+{
+	init_irq_alloc_info(arg, NULL);
+	/* TODO: Do we really need add this type? */
+	arg->type = X86_IRQ_ALLOC_TYPE_VIS;
+
+	return 0;
+}
+
+static void vis_set_desc(msi_alloc_info_t *arg, struct msi_desc *desc)
+{
+	arg->vis_hwirq = vis_domain_calc_hwirq(desc);
+}
+
+static struct msi_domain_ops vis_domain_ops = {
+	.get_hwirq      = vis_get_hwirq,
+	.msi_prepare    = vis_prepare,
+	.set_desc       = vis_set_desc,
+};
+
+static struct msi_domain_info vis_domain_info = {
+	.flags          = MSI_FLAG_USE_DEF_DOM_OPS | MSI_FLAG_USE_DEF_CHIP_OPS,
+	.ops            = &vis_domain_ops,
+	.chip           = &vis_controller,
+	.handler        = handle_edge_irq,
+	.handler_name   = "edge",
+};
+
+struct irq_domain *vis_get_irq_domain(void)
+{
+	static struct irq_domain *vis_domain;
+	struct fwnode_handle *fn;
+
+	if (vis_domain)
+		return vis_domain;
+
+	fn = irq_domain_alloc_named_fwnode("VIS");
+	if (fn) {
+		vis_domain =
+			msi_create_irq_domain(fn, &vis_domain_info,
+				x86_vector_domain);
+		irq_domain_free_fwnode(fn);
+	}
+
+	return vis_domain;
+}
+EXPORT_SYMBOL_GPL(vis_get_irq_domain);
 
 /*
  * IRQ Chip for MSI PCI/PCI-X/PCI-Express Devices,

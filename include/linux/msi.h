@@ -29,6 +29,13 @@ static inline void get_cached_msi_msg(unsigned int irq, struct msi_msg *msg)
 typedef void (*irq_write_msi_msg_t)(struct msi_desc *desc,
 				    struct msi_msg *msg);
 
+/* VIS interrupt functions for struct irq_chip */
+void vis_unmask_irq(struct irq_data *data);
+void vis_mask_irq(struct irq_data *data);
+void vis_domain_write_msg(struct irq_data *irq_data, struct msi_msg *msg);
+irq_hw_number_t vis_domain_calc_hwirq(struct msi_desc *desc);
+
+
 /**
  * platform_msi_desc - Platform device specific msi descriptor data
  * @msi_priv_data:	Pointer to platform private data

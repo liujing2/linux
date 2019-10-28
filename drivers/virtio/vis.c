@@ -25,6 +25,39 @@ int vis_irq_vector(struct device *dev, unsigned int nr)
 }
 EXPORT_SYMBOL_GPL(vis_irq_vector);
 
+
+/**
+ * vis_setup_irqs - setup irqs from VIS domain
+ * @dev: device to operate on
+ * @nvec: request interrupt vector number.
+ */
+int vis_setup_irqs(struct device *dev, int nvec)
+{
+	struct irq_domain *vis_domain = vis_get_irq_domain();
+	struct irq_alloc_info info;
+
+	if (!vis_domain)
+		return -1;
+
+	init_irq_alloc_info(&info, NULL);
+	info.type = X86_IRQ_ALLOC_TYPE_VIS;
+
+	return msi_domain_alloc_irqs(vis_domain, dev, nvec);
+}
+EXPORT_SYMBOL_GPL(vis_setup_irqs);
+
+/**
+ * vis_domain_calc_hwirq - Generate a unique ID for a VIS interrupt
+ * @desc:	Pointer to the msi descriptor
+ *
+ * The ID number is only used within the irqdomain.
+ */
+irq_hw_number_t vis_domain_calc_hwirq(struct msi_desc *desc)
+{
+	static irq_hw_number_t num = 0;
+
+	return num++;
+}
 /**
  * TODO
  * Write to the MBA register for this desc,
