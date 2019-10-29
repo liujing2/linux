@@ -122,6 +122,9 @@
 #define VIRTIO_MMIO_QUEUE_USED_LOW	0x0a0
 #define VIRTIO_MMIO_QUEUE_USED_HIGH	0x0a4
 
+/* VIS queue vector */
+#define VIRTIO_MMIO_QUEUE_VECTOR	0x0a8
+
 /* Configuration atomicity value */
 #define VIRTIO_MMIO_CONFIG_GENERATION	0x0fc
 
@@ -129,7 +132,8 @@
  * the per-driver configuration space - Read Write */
 #define VIRTIO_MMIO_CONFIG		0x100
 
-
+/* Vector value used to disable VIS for queue */
+#define VIRTIO_VIS_NO_VECTOR		0xffff
 
 /*
  * Interrupt flags (re: interrupt status & acknowledge registers)

@@ -6,4 +6,5 @@
 
 int vis_irq_vector(struct device *dev, unsigned int nr);
 int vis_setup_irqs(struct device *dev, int nvec);
+void free_vis_irqs(struct device *dev);
 #endif

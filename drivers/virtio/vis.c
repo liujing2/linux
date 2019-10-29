@@ -37,7 +37,7 @@ int vis_setup_irqs(struct device *dev, int nvec)
 	struct irq_alloc_info info;
 
 	if (!vis_domain)
-		return -1;
+		return -ENOSYS;
 
 	init_irq_alloc_info(&info, NULL);
 	info.type = X86_IRQ_ALLOC_TYPE_VIS;
@@ -45,6 +45,41 @@ int vis_setup_irqs(struct device *dev, int nvec)
 	return msi_domain_alloc_irqs(vis_domain, dev, nvec);
 }
 EXPORT_SYMBOL_GPL(vis_setup_irqs);
+
+static void vis_teardown_irqs(struct device *dev)
+{
+	struct irq_domain *domain;
+
+	domain = dev_get_msi_domain(dev);
+	if (domain && irq_domain_is_hierarchy(domain))
+		/* VIS domain uses hierarchy */
+		msi_domain_free_irqs(domain, dev);
+	else
+		// TODO
+		return;
+}
+
+void free_vis_irqs(struct device *dev)
+{
+	struct list_head *msi_list = dev_to_msi_list(dev);
+	struct msi_desc *tmp, *entry;
+	int i;
+
+	for_each_msi_entry(entry, dev) {
+		if (entry->irq)
+			for (i = 0; i < entry->nvec_used; i++)
+				BUG_ON(irq_has_action(entry->irq + i));
+	}
+	vis_teardown_irqs(dev);
+
+	list_for_each_entry_safe(entry, tmp, msi_list, list) {
+		/* TODO: Do we need iounmap for table */
+		list_del(&entry->list);
+		free_msi_entry(entry);
+	}
+}
+EXPORT_SYMBOL_GPL(free_vis_irqs);
+
 
 /**
  * vis_domain_calc_hwirq - Generate a unique ID for a VIS interrupt

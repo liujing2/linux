@@ -68,7 +68,8 @@
 #include <linux/virtio_config.h>
 #include <uapi/linux/virtio_mmio.h>
 #include <linux/virtio_ring.h>
-
+#include <linux/msi.h>
+#include "vis.h"
 
 
 /* The alignment to use between consumer and producer parts of vring.
@@ -90,6 +91,11 @@ struct virtio_mmio_device {
 	/* a list of queues so we can dispatch IRQs */
 	spinlock_t lock;
 	struct list_head virtqueues;
+
+	/* multiple interrupt, vectors allocated from 0 */
+	unsigned vis_used_vectors;
+	void __iomem *vet_base;
+	void __iomem *mba_base;
 };
 
 struct virtio_mmio_vq_info {
@@ -98,6 +104,9 @@ struct virtio_mmio_vq_info {
 
 	/* the list node for the virtqueues list */
 	struct list_head node;
+
+	/* vis vector for this queue */
+	unsigned vis_vector;
 };
 
 
@@ -307,6 +316,14 @@ static irqreturn_t vm_interrupt(int irq, void *opaque)
 	return ret;
 }
 
+/* Handle a configuration change */
+static irqreturn_t vm_config_interrupt(int irq, void *opaque)
+{
+	struct virtio_mmio_device *vm_dev = opaque;
+
+	virtio_config_changed(&vm_dev->vdev);
+	return IRQ_HANDLED;
+}
 
 
 static void vm_del_vq(struct virtqueue *vq)
@@ -347,13 +364,14 @@ static void vm_del_vqs(struct virtio_device *vdev)
 
 static struct virtqueue *vm_setup_vq(struct virtio_device *vdev, unsigned index,
 				  void (*callback)(struct virtqueue *vq),
-				  const char *name, bool ctx)
+				  const char *name, bool ctx, unsigned vis_vec)
 {
 	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
 	struct virtio_mmio_vq_info *info;
 	struct virtqueue *vq;
 	unsigned long flags;
 	unsigned int num;
+	unsigned vis_vector;
 	int err;
 
 	if (!name)
@@ -375,6 +393,8 @@ static struct virtqueue *vm_setup_vq(struct virtio_device *vdev, unsigned index,
 		err = -ENOMEM;
 		goto error_kmalloc;
 	}
+
+	info->vis_vector = vis_vec;
 
 	num = readl(vm_dev->base + VIRTIO_MMIO_QUEUE_NUM_MAX);
 	if (num == 0) {
@@ -427,12 +447,19 @@ static struct virtqueue *vm_setup_vq(struct virtio_device *vdev, unsigned index,
 		writel((u32)addr, vm_dev->base + VIRTIO_MMIO_QUEUE_USED_LOW);
 		writel((u32)(addr >> 32),
 				vm_dev->base + VIRTIO_MMIO_QUEUE_USED_HIGH);
-
-		writel(1, vm_dev->base + VIRTIO_MMIO_QUEUE_READY);
 	}
 
 	vq->priv = info;
 	info->vq = vq;
+
+	if (vis_vec != VIRTIO_VIS_NO_VECTOR) {
+		writel(vis_vec, vm_dev->base + VIRTIO_MMIO_QUEUE_VECTOR);
+		vis_vector = readl(vm_dev->base + VIRTIO_MMIO_QUEUE_VECTOR);
+		if (vis_vector == VIRTIO_VIS_NO_VECTOR) {
+			err = -EBUSY;
+			goto error_bad_pfn;
+		}
+	}
 
 	spin_lock_irqsave(&vm_dev->lock, flags);
 	list_add(&info->node, &vm_dev->virtqueues);
@@ -455,12 +482,12 @@ error_available:
 	return ERR_PTR(err);
 }
 
-static int vm_find_vqs(struct virtio_device *vdev, unsigned nvqs,
-		       struct virtqueue *vqs[],
-		       vq_callback_t *callbacks[],
-		       const char * const names[],
-		       const bool *ctx,
-		       struct irq_affinity *desc)
+static int vm_find_vqs_intx(struct virtio_device *vdev, unsigned nvqs,
+			    struct virtqueue *vqs[],
+			    vq_callback_t *callbacks[],
+			    const char * const names[],
+			    const bool *ctx,
+			    struct irq_affinity *desc)
 {
 	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
 	unsigned int irq = platform_get_irq(vm_dev->pdev, 0);
@@ -478,13 +505,213 @@ static int vm_find_vqs(struct virtio_device *vdev, unsigned nvqs,
 		}
 
 		vqs[i] = vm_setup_vq(vdev, queue_idx++, callbacks[i], names[i],
-				     ctx ? ctx[i] : false);
+				     ctx ? ctx[i] : false, VIRTIO_VIS_NO_VECTOR);
 		if (IS_ERR(vqs[i])) {
 			vm_del_vqs(vdev);
 			return PTR_ERR(vqs[i]);
 		}
 	}
 
+	return 0;
+}
+
+static int vis_setup_entries(struct device *dev, void __iomem *vet_base,
+			     void __iomem *mba_base, int nvec,
+			     struct irq_affinity *affd)
+{
+	struct msi_desc *entry;
+	struct irq_affinity_desc *curmsk, *masks = NULL;
+	int i, ret, nvec_aff;
+
+	if (affd) {
+		nvec_aff = irq_calc_affinity_vectors(nvec, nvec, affd);
+		if (nvec_aff < nvec) {
+			return -ENOSPC;
+		}
+		masks = irq_create_affinity_masks(nvec, affd);
+	}
+
+	for (i = 0, curmsk = masks; i < nvec; i++) {
+		entry = alloc_msi_entry(dev, 1, curmsk);
+		if (!entry) {
+			if (i)
+				free_vis_irqs(dev);
+			/* No enough memory. Don't try again */
+			ret = -ENOMEM;
+			goto out;
+		}
+
+		entry->vis.vis_attrib.entry_nr = i;
+		entry->vis.base.mask_base = mba_base;
+		entry->vis.base.vet_base = vet_base;
+
+		list_add_tail(&entry->list, dev_to_msi_list(dev));
+		if (masks)
+			curmsk++;
+	}
+
+	ret = 0;
+out:
+	kfree(masks);
+	return ret;
+}
+
+static void vis_map_region(struct virtio_mmio_device *vm_dev, unsigned nr_entries)
+{
+	u32 vet_offset, mba_offset;
+
+	/* Offset from the start of virtio-mmio Configuration */
+	vet_offset = readl(vm_dev->base + 0xb4);
+	mba_offset = readl(vm_dev->base + 0xc0);
+
+	/* VET takes 12 bytes per entry for 64bit address + 32bit data */
+	vm_dev->vet_base = vm_dev->base + vet_offset;
+	/* MBA takes 4 bytes for maximum 32 vectors */
+	vm_dev->mba_base = vm_dev->base + mba_offset;
+}
+
+static int vm_request_vis_vectors(struct virtio_device *vdev, unsigned nvqs,
+				  struct virtqueue *vqs[],
+				  vq_callback_t *callbacks[],
+				  struct irq_affinity *desc)
+{
+	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
+	int ret = -ENOMEM;
+	int i, vector_count, nvectors = 1;
+	unsigned v;
+
+	// log
+	struct msi_desc *entry;
+
+	/* Support max 32 vectors now */
+	if (nvqs > 32)
+		return -1;
+
+	/* Only support vector per vqs now */
+	for (i = 0; i < nvqs; i++)
+		if (callbacks[i])
+			++nvectors;
+
+	vector_count = readl(vm_dev->base + 0xb0);
+	if (vector_count != nvectors)
+		return -1;
+
+	/* Map vis tables */
+	vis_map_region(vm_dev, nvectors);
+
+	if (desc) {
+		desc->pre_vectors++; /* virtio config vector */
+	}
+
+	ret = vis_setup_entries(&(vdev->dev), vm_dev->vet_base,
+				vm_dev->mba_base, nvectors, desc);
+	if (ret)
+		return ret;
+
+	/* allocate virq and set into msi_desc->irq */
+	ret = vis_setup_irqs(&(vdev->dev), nvectors);
+	if (ret)
+		goto out_avail;
+
+	/* Mask all interrupts now */
+	writel(~0, vm_dev->mba_base);
+
+	/* Set the vector used for configuration */
+	v = vm_dev->vis_used_vectors;
+	ret = request_irq(vis_irq_vector(&(vdev->dev), v), vm_config_interrupt,
+			  0, dev_name(&vdev->dev), vm_dev);
+	if (ret)
+		goto error;
+
+	++vm_dev->vis_used_vectors;
+
+	return nvectors;
+
+out_avail:
+	/* TODO */
+	free_vis_irqs(&(vdev->dev));
+error:
+	return ret;
+}
+
+/* Limit: Support only per_vq_vectors */
+static int vm_find_vqs_vis(struct virtio_device *vdev, unsigned nvqs,
+			    struct virtqueue *vqs[],
+			    vq_callback_t *callbacks[],
+			    const char * const names[],
+			    const bool *ctx,
+			    struct irq_affinity *desc)
+{
+	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
+	int i, err, request_vector, allocated_vectors, queue_idx = 0;
+	unsigned vis_vec = 0;
+
+	request_vector = vm_request_vis_vectors(vdev, nvqs, vqs, callbacks, desc);
+	if (request_vector < 0) {
+		err = request_vector;
+		goto error_find;
+	}
+
+	allocated_vectors = vm_dev->vis_used_vectors;
+
+	for (i = 0; i < nvqs; ++i) {
+		if (!names[i]) {
+			vqs[i] = NULL;
+			continue;
+		}
+		if (!callbacks[i])
+			vis_vec = VIRTIO_VIS_NO_VECTOR; // NO_VECTOR
+		else if (request_vector == (1 + nvqs))
+			vis_vec = allocated_vectors++;
+
+		vqs[i] = vm_setup_vq(vdev, queue_idx++, callbacks[i], names[i],
+				     ctx ? ctx[i] : false, vis_vec);
+		if (IS_ERR(vqs[i]))
+			goto error_find;
+
+		if (vis_vec == VIRTIO_VIS_NO_VECTOR)
+			continue;
+
+		err = request_irq(vis_irq_vector(&(vdev->dev), vis_vec),
+				  vring_interrupt, 0,
+				  dev_name(&vdev->dev), vqs[i]);
+		if (err)
+			goto error_find;
+	}
+	return 0;
+
+error_find:
+	vm_del_vqs(vdev);
+
+	return err;
+}
+
+static int vm_find_vqs(struct virtio_device *vdev, unsigned nvqs,
+		       struct virtqueue *vqs[],
+		       vq_callback_t *callbacks[],
+		       const char * const names[],
+		       const bool *ctx,
+		       struct irq_affinity *desc)
+{
+	int err;
+	struct virtqueue *vq;
+	struct virtio_mmio_device *vm_dev = to_virtio_mmio_device(vdev);
+
+	err = vm_find_vqs_vis(vdev, nvqs, vqs, callbacks, names, ctx, desc);
+	if (!err)
+		goto queue_ready;
+
+	err = vm_find_vqs_intx(vdev, nvqs, vqs, callbacks, names, ctx, desc);
+	if (!err)
+		goto queue_ready;
+	else
+		return err;
+
+queue_ready:
+	list_for_each_entry(vq, &vdev->vqs, list) {
+		writel(vq->index, vm_dev->base + VIRTIO_MMIO_QUEUE_SEL);
+		writel(1, vm_dev->base + VIRTIO_MMIO_QUEUE_READY);
+	}
 	return 0;
 }
 
